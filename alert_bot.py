@@ -17,8 +17,6 @@ import sys
 from datetime import datetime, time as dtime
 import pytz
 import httpx
-import yfinance as yf
-import pandas as pd
 
 try:
     from dotenv import load_dotenv
@@ -30,6 +28,7 @@ import os
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+ALPHA_VANTAGE_KEY  = os.getenv("ALPHA_VANTAGE_KEY", "")
 TICKER             = os.getenv("TICKER", "QQQ")
 
 logging.basicConfig(
@@ -61,47 +60,78 @@ def send_telegram(message: str):
 
 
 def fetch_1min_data():
-    """Fetch today's 1-min data using curl_cffi session to bypass rate limits."""
-    from curl_cffi import requests as curl_requests
-    session = curl_requests.Session(impersonate="chrome")
-    df = yf.download(
-        TICKER,
-        period="1d",
-        interval="1m",
-        progress=False,
-        auto_adjust=True,
-        session=session,
-    )
-    if df.empty:
+    """Fetch today's 1-min intraday data from Alpha Vantage."""
+    url = "https://www.alphavantage.co/query"
+    params = {
+        "function":    "TIME_SERIES_INTRADAY",
+        "symbol":      TICKER,
+        "interval":    "1min",
+        "outputsize":  "full",
+        "datatype":    "json",
+        "apikey":      ALPHA_VANTAGE_KEY,
+    }
+    try:
+        r = httpx.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+
+        ts = data.get("Time Series (1min)")
+        if not ts:
+            log.error(f"Alpha Vantage response: {data}")
+            return None
+
+        # Convert to list of dicts, filter to today only
+        today = now_et().strftime("%Y-%m-%d")
+        candles = []
+        for dt_str, values in ts.items():
+            if dt_str.startswith(today):
+                # Alpha Vantage times are in ET
+                dt = ET.localize(datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S"))
+                candles.append({
+                    "dt":    dt,
+                    "open":  float(values["1. open"]),
+                    "high":  float(values["2. high"]),
+                    "low":   float(values["3. low"]),
+                    "close": float(values["4. close"]),
+                })
+
+        candles.sort(key=lambda x: x["dt"])
+        log.info(f"Fetched {len(candles)} 1-min candles from Alpha Vantage.")
+        return candles
+
+    except Exception as e:
+        log.error(f"Alpha Vantage fetch failed: {e}")
         return None
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    df.index = df.index.tz_convert(ET)
-    return df
 
 
-def get_30min_body():
-    log.info("Fetching 30-min opening candle (9:00-9:30 ET)...")
-    df = fetch_1min_data()
-    if df is None:
-        log.error("No data returned from Yahoo Finance.")
-        return None, None
-    window = df.between_time("09:00", "09:29")
-    if window.empty:
+def get_30min_body(candles):
+    """
+    From the 1-min candles, find the 9:00-9:30 window
+    and return (body_high, body_low) using open/close only.
+    """
+    window = [
+        c for c in candles
+        if dtime(9, 0) <= c["dt"].time() < dtime(9, 30)
+    ]
+
+    if not window:
         log.warning("No candles found in 9:00-9:30 window.")
         return None, None
-    body_high = max(window["Open"].max(), window["Close"].max())
-    body_low  = min(window["Open"].min(), window["Close"].min())
+
+    body_high = max(max(c["open"], c["close"]) for c in window)
+    body_low  = min(min(c["open"], c["close"]) for c in window)
+
     log.info(f"30-min body - High: ${body_high:.2f} | Low: ${body_low:.2f}")
     return body_high, body_low
 
 
-def get_latest_1min_candle():
-    df = fetch_1min_data()
-    if df is None or len(df) < 2:
-        return None, None
-    candle = df.iloc[-2]
-    return float(candle["Open"]), float(candle["Close"])
+def get_latest_1min_candle(candles):
+    """Returns the most recent completed 1-min candle."""
+    now = now_et()
+    completed = [c for c in candles if c["dt"] < now]
+    if not completed:
+        return None
+    return completed[-1]
 
 
 def run():
@@ -111,30 +141,41 @@ def run():
         log.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in .env")
         sys.exit(1)
 
+    if not ALPHA_VANTAGE_KEY:
+        log.error("Missing ALPHA_VANTAGE_KEY in .env")
+        sys.exit(1)
+
     if now_et().weekday() >= 5:
         log.info("Weekend - exiting.")
         send_telegram("QQQ Bot: Weekend, no alert today.")
         return
 
+    # Wait until 9:30 AM ET
     target = now_et().replace(hour=9, minute=30, second=5, microsecond=0)
     wait = (target - now_et()).total_seconds()
     if wait > 0:
         log.info(f"Waiting {wait:.0f}s until 9:30 AM ET...")
         time.sleep(wait)
 
-    body_high, body_low = get_30min_body()
+    # Fetch all today's 1-min candles
+    candles = fetch_1min_data()
+    if not candles:
+        send_telegram("QQQ Bot: Could not fetch market data today.")
+        return
 
-    if body_high is None or body_low is None:
-        send_telegram("QQQ Bot: Could not fetch opening candle data today.")
+    # Get the opening body range
+    body_high, body_low = get_30min_body(candles)
+    if body_high is None:
+        send_telegram("QQQ Bot: No data in 9:00-9:30 window today.")
         return
 
     log.info(f"Watching for breakout - Body High: ${body_high:.2f} | Body Low: ${body_low:.2f}")
     send_telegram(
-        f"QQQ Bot Active\n\n"
-        f"Opening body range set:\n"
-        f"Upper: ${body_high:.2f}\n"
-        f"Lower: ${body_low:.2f}\n\n"
-        f"Watching 1-min candles for a body breakout..."
+        f"*QQQ Bot Active*\n\n"
+        f"Opening body range:\n"
+        f"Upper: `${body_high:.2f}`\n"
+        f"Lower: `${body_low:.2f}`\n\n"
+        f"_Watching 1-min candles for a body breakout..._"
     )
 
     alert_sent = False
@@ -145,18 +186,23 @@ def run():
 
         if current.time() >= stop_time:
             log.info("10:00 AM reached - no breakout today.")
-            send_telegram("QQQ Bot: No body breakout before 10:00 AM. No trade today.")
+            send_telegram("*QQQ Bot*: No body breakout before 10:00 AM. No trade today.")
             break
 
-        candle_open, candle_close = get_latest_1min_candle()
-
-        if candle_open is None:
-            log.warning("Could not fetch 1-min candle, retrying...")
-            time.sleep(15)
+        # Refresh candles every loop
+        candles = fetch_1min_data()
+        if not candles:
+            log.warning("Could not fetch candles, retrying in 30s...")
+            time.sleep(30)
             continue
 
-        candle_body_high = max(candle_open, candle_close)
-        candle_body_low  = min(candle_open, candle_close)
+        latest = get_latest_1min_candle(candles)
+        if not latest:
+            time.sleep(30)
+            continue
+
+        candle_body_high = max(latest["open"], latest["close"])
+        candle_body_low  = min(latest["open"], latest["close"])
 
         log.info(
             f"{current.strftime('%H:%M')} - "
@@ -166,30 +212,29 @@ def run():
 
         if candle_body_high > body_high:
             send_telegram(
-                f"QQQ LONG Signal!\n\n"
-                f"A 1-min candle body has broken above the opening range.\n\n"
-                f"Opening body high: ${body_high:.2f}\n"
-                f"Current candle body high: ${candle_body_high:.2f}\n\n"
-                f"Look at QQQ now - consider a LONG entry\n"
-                f"Check your chart and manage your own entry/exit"
+                f"*QQQ LONG Signal!*\n\n"
+                f"1-min candle body broke *above* the opening range\n\n"
+                f"Opening body high: `${body_high:.2f}`\n"
+                f"Candle body high: `${candle_body_high:.2f}`\n\n"
+                f"*Look at QQQ now - consider a LONG entry*"
             )
             log.info("LONG alert sent.")
             alert_sent = True
 
         elif candle_body_low < body_low:
             send_telegram(
-                f"QQQ SHORT Signal!\n\n"
-                f"A 1-min candle body has broken below the opening range.\n\n"
-                f"Opening body low: ${body_low:.2f}\n"
-                f"Current candle body low: ${candle_body_low:.2f}\n\n"
-                f"Look at QQQ now - consider a SHORT entry\n"
-                f"Check your chart and manage your own entry/exit"
+                f"*QQQ SHORT Signal!*\n\n"
+                f"1-min candle body broke *below* the opening range\n\n"
+                f"Opening body low: `${body_low:.2f}`\n"
+                f"Candle body low: `${candle_body_low:.2f}`\n\n"
+                f"*Look at QQQ now - consider a SHORT entry*"
             )
             log.info("SHORT alert sent.")
             alert_sent = True
 
         else:
-            time.sleep(30)
+            # Alpha Vantage free tier: 25 calls/day - check every 60s to conserve
+            time.sleep(60)
 
     log.info("Bot finished.")
 
