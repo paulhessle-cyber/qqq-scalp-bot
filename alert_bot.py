@@ -18,6 +18,7 @@ from datetime import datetime, time as dtime
 import pytz
 import httpx
 import yfinance as yf
+import pandas as pd
 
 # ── Load .env if present ─────────────────────────────────────────────────────
 try:
@@ -61,79 +62,59 @@ def send_telegram(message: str):
         log.error(f"Telegram failed: {e}")
 
 
-def get_30min_body():
-    """
-    Fetch the 9:00–9:30 ET candle body for QQQ.
-    Returns (body_high, body_low) using open/close only (no wicks).
-    """
-    log.info("Fetching 30-min opening candle (9:00–9:30 ET)...")
-    ticker = yf.Ticker(TICKER)
-
-    # Fetch today's 1-min data and build the 9:00–9:30 window manually
-    df = ticker.history(period="1d", interval="1m")
-
+def fetch_1min_data():
+    """Fetch today's 1-min data for TICKER using yf.download."""
+    df = yf.download(TICKER, period="1d", interval="1m", progress=False, auto_adjust=True)
     if df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df.index = df.index.tz_convert(ET)
+    return df
+
+
+def get_30min_body():
+    log.info("Fetching 30-min opening candle (9:00–9:30 ET)...")
+    df = fetch_1min_data()
+    if df is None:
         log.error("No data returned from Yahoo Finance.")
         return None, None
-
-    # Convert index to ET
-    df.index = df.index.tz_convert(ET)
-
-    # Filter to 9:00–9:30 AM ET (pre-market opens at 9:00 for some data)
     window = df.between_time("09:00", "09:29")
-
     if window.empty:
         log.warning("No candles found in 9:00–9:30 window.")
         return None, None
-
-    # Body = max/min of open and close across all 1-min candles in window
     body_high = max(window["Open"].max(), window["Close"].max())
     body_low  = min(window["Open"].min(), window["Close"].min())
-
     log.info(f"30-min body — High: ${body_high:.2f} | Low: ${body_low:.2f}")
     return body_high, body_low
 
 
 def get_latest_1min_candle():
-    """Returns the most recent completed 1-min candle as (open, close)."""
-    ticker = yf.Ticker(TICKER)
-    df = ticker.history(period="1d", interval="1m")
-
-    if df.empty:
+    df = fetch_1min_data()
+    if df is None or len(df) < 2:
         return None, None
-
-    df.index = df.index.tz_convert(ET)
-
-    # Get the last completed candle (second to last row, last may be forming)
-    if len(df) < 2:
-        return None, None
-
     candle = df.iloc[-2]
-    return candle["Open"], candle["Close"]
+    return float(candle["Open"]), float(candle["Close"])
 
 
 def run():
     log.info(f"QQQ Alert Bot started — {now_et().strftime('%Y-%m-%d %H:%M ET')}")
 
-    # ── Validation ────────────────────────────────────────────────────────────
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in .env")
         sys.exit(1)
 
-    # ── Weekend check ─────────────────────────────────────────────────────────
     if now_et().weekday() >= 5:
         log.info("Weekend — exiting.")
         send_telegram("⏸ QQQ Bot: Weekend, no alert today.")
         return
 
-    # ── Wait until 9:30 AM ET ─────────────────────────────────────────────────
     target = now_et().replace(hour=9, minute=30, second=5, microsecond=0)
     wait = (target - now_et()).total_seconds()
     if wait > 0:
         log.info(f"Waiting {wait:.0f}s until 9:30 AM ET...")
         time.sleep(wait)
 
-    # ── Get the 30-min opening body ───────────────────────────────────────────
     body_high, body_low = get_30min_body()
 
     if body_high is None or body_low is None:
@@ -149,7 +130,6 @@ def run():
         f"_Watching 1-min candles for a body breakout..._"
     )
 
-    # ── Watch 1-min candles until 10:00 AM ───────────────────────────────────
     alert_sent = False
     stop_time  = dtime(10, 0)
 
@@ -177,7 +157,6 @@ def run():
             f"Watching: ${body_low:.2f}–${body_high:.2f}"
         )
 
-        # ── LONG breakout ────────────────────────────────────────────────────
         if candle_body_high > body_high:
             msg = (
                 f"🟢 *QQQ LONG Signal!*\n\n"
@@ -191,7 +170,6 @@ def run():
             log.info("LONG alert sent.")
             alert_sent = True
 
-        # ── SHORT breakout ───────────────────────────────────────────────────
         elif candle_body_low < body_low:
             msg = (
                 f"🔴 *QQQ SHORT Signal!*\n\n"
@@ -206,7 +184,6 @@ def run():
             alert_sent = True
 
         else:
-            # No breakout yet — check again in 30 seconds
             time.sleep(30)
 
     log.info("Bot finished.")
