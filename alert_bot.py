@@ -1,12 +1,12 @@
 """
-QQQ Morning Alert Bot
+CSPX Morning Alert Bot
 ---------------------
 Strategy:
-  1. 9:00-9:30 AM ET  - record the 30-min opening candle BODY (no wicks)
-  2. 9:30 AM onwards  - watch 1-min candles
-                         body breaks above body_high -> LONG alert
-                         body breaks below body_low  -> SHORT alert
-  3. One alert max, stop at 10:00 AM ET
+  1. 8:00-8:30 AM London time - record the 30-min opening candle BODY (no wicks)
+  2. 8:30 AM onwards          - watch 1-min candles
+                                 body breaks above body_high -> LONG alert
+                                 body breaks below body_low  -> SHORT alert
+  3. One alert max, stop at 9:00 AM London time
 """
 
 import time
@@ -27,7 +27,7 @@ import os
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 TWELVE_DATA_KEY    = os.getenv("TWELVE_DATA_KEY", "")
-TICKER             = os.getenv("TICKER", "QQQ")
+TICKER             = os.getenv("TICKER", "CSPX.L")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,11 +35,11 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger(__name__)
-ET = pytz.timezone("America/New_York")
+LONDON = pytz.timezone("Europe/London")
 
 
-def now_et():
-    return datetime.now(ET)
+def now_london():
+    return datetime.now(LONDON)
 
 
 def send_telegram(message: str):
@@ -63,7 +63,7 @@ def fetch_1min_candles():
         "symbol":      TICKER,
         "interval":    "1min",
         "outputsize":  "90",
-        "timezone":    "America/New_York",
+        "timezone":    "Europe/London",
         "apikey":      TWELVE_DATA_KEY,
     }
     try:
@@ -80,11 +80,11 @@ def fetch_1min_candles():
             log.error("No values returned from Twelve Data.")
             return None
 
-        today = now_et().strftime("%Y-%m-%d")
+        today = now_london().strftime("%Y-%m-%d")
         candles = []
         for v in values:
             if v["datetime"].startswith(today):
-                dt = ET.localize(datetime.strptime(v["datetime"], "%Y-%m-%d %H:%M:%S"))
+                dt = LONDON.localize(datetime.strptime(v["datetime"], "%Y-%m-%d %H:%M:%S"))
                 candles.append({
                     "dt":    dt,
                     "open":  float(v["open"]),
@@ -103,10 +103,10 @@ def fetch_1min_candles():
 def get_30min_body(candles):
     window = [
         c for c in candles
-        if dtime(9, 0) <= c["dt"].time() < dtime(9, 30)
+        if dtime(8, 0) <= c["dt"].time() < dtime(8, 30)
     ]
     if not window:
-        log.warning("No candles in 9:00-9:30 window.")
+        log.warning("No candles in 8:00-8:30 window.")
         return None, None
 
     body_high = max(max(c["open"], c["close"]) for c in window)
@@ -116,7 +116,7 @@ def get_30min_body(candles):
 
 
 def run():
-    log.info(f"QQQ Alert Bot started - {now_et().strftime('%Y-%m-%d %H:%M ET')}")
+    log.info(f"CSPX Alert Bot started - {now_london().strftime('%Y-%m-%d %H:%M London')}")
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in .env")
@@ -126,50 +126,49 @@ def run():
         log.error("Missing TWELVE_DATA_KEY in .env")
         sys.exit(1)
 
-    if now_et().weekday() >= 5:
+    if now_london().weekday() >= 5:
         log.info("Weekend - exiting.")
-        send_telegram("QQQ Bot: Weekend, no alert today.")
+        send_telegram("CSPX Bot: Weekend, no alert today.")
         return
 
-    # Wait until 9:30 AM ET
-    target = now_et().replace(hour=9, minute=30, second=5, microsecond=0)
-    wait = (target - now_et()).total_seconds()
+    # Wait until 8:30 AM London time
+    target = now_london().replace(hour=8, minute=30, second=5, microsecond=0)
+    wait = (target - now_london()).total_seconds()
     if wait > 0:
-        log.info(f"Waiting {wait:.0f}s until 9:30 AM ET...")
+        log.info(f"Waiting {wait:.0f}s until 8:30 AM London time...")
         time.sleep(wait)
 
     # Fetch candles and get opening body
     candles = fetch_1min_candles()
     if not candles:
-        send_telegram("QQQ Bot: Could not fetch market data today.")
+        send_telegram("CSPX Bot: Could not fetch market data today.")
         return
 
     body_high, body_low = get_30min_body(candles)
     if body_high is None:
-        send_telegram("QQQ Bot: No data in 9:00-9:30 window today.")
+        send_telegram("CSPX Bot: No data in 8:00-8:30 window today.")
         return
 
-    log.info(f"Watching - Body High: ${body_high:.2f} | Body Low: ${body_low:.2f}")
+    log.info(f"Watching - Body High: {body_high:.2f} | Body Low: {body_low:.2f}")
     send_telegram(
-        f"*QQQ Bot Active*\n\n"
+        f"*CSPX Bot Active*\n\n"
         f"Opening body range:\n"
-        f"Upper: `${body_high:.2f}`\n"
-        f"Lower: `${body_low:.2f}`\n\n"
+        f"Upper: `{body_high:.2f}`\n"
+        f"Lower: `{body_low:.2f}`\n\n"
         f"_Watching 1-min candles for a body breakout..._"
     )
 
     alert_sent = False
-    stop_time  = dtime(10, 0)
+    stop_time  = dtime(9, 0)
 
     while not alert_sent:
-        current = now_et()
+        current = now_london()
 
         if current.time() >= stop_time:
-            log.info("10:00 AM - no breakout today.")
-            send_telegram("*QQQ Bot*: No breakout before 10:00 AM. No trade today.")
+            log.info("9:00 AM - no breakout today.")
+            send_telegram("*CSPX Bot*: No breakout before 9:00 AM. No trade today.")
             break
 
-        # Wait for next candle then refresh
         time.sleep(60)
 
         candles = fetch_1min_candles()
@@ -183,28 +182,28 @@ def run():
 
         log.info(
             f"{current.strftime('%H:%M')} - "
-            f"Body: ${candle_body_low:.2f}-${candle_body_high:.2f} | "
-            f"Range: ${body_low:.2f}-${body_high:.2f}"
+            f"Body: {candle_body_low:.2f}-{candle_body_high:.2f} | "
+            f"Range: {body_low:.2f}-{body_high:.2f}"
         )
 
         if candle_body_high > body_high:
             send_telegram(
-                f"*QQQ LONG Signal!*\n\n"
+                f"*CSPX LONG Signal!*\n\n"
                 f"1-min candle body broke *above* the opening range\n\n"
-                f"Opening body high: `${body_high:.2f}`\n"
-                f"Candle body high: `${candle_body_high:.2f}`\n\n"
-                f"*Look at QQQ now - consider a LONG entry*"
+                f"Opening body high: `{body_high:.2f}`\n"
+                f"Candle body high: `{candle_body_high:.2f}`\n\n"
+                f"*Look at CSPX now - consider a LONG entry*"
             )
             log.info("LONG alert sent.")
             alert_sent = True
 
         elif candle_body_low < body_low:
             send_telegram(
-                f"*QQQ SHORT Signal!*\n\n"
+                f"*CSPX SHORT Signal!*\n\n"
                 f"1-min candle body broke *below* the opening range\n\n"
-                f"Opening body low: `${body_low:.2f}`\n"
-                f"Candle body low: `${candle_body_low:.2f}`\n\n"
-                f"*Look at QQQ now - consider a SHORT entry*"
+                f"Opening body low: `{body_low:.2f}`\n"
+                f"Candle body low: `{candle_body_low:.2f}`\n\n"
+                f"*Look at CSPX now - consider a SHORT entry*"
             )
             log.info("SHORT alert sent.")
             alert_sent = True
